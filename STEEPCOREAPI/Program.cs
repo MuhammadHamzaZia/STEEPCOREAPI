@@ -1,0 +1,291 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using STEEPCOREAPI.Middleware;
+using STEEPCOREAPI.Modules.AiEngine.Services;
+using STEEPCOREAPI.Modules.Blueprints.Services;
+using STEEPCOREAPI.Modules.Marketplace.Services;
+using STEEPCOREAPI.Shared.Database;
+using STEEPCOREAPI.Shared.Interfaces;
+using STEEPCOREAPI.Shared.Models;
+using System.Text;
+
+var builder = WebApplication.CreateBuilder(args);
+var configuration = builder.Configuration;
+
+// Load environment-specific settings
+if (!builder.Environment.IsDevelopment())
+{
+    builder.Configuration.AddJsonFile("appsettings.Production.json", optional: false, reloadOnChange: false);
+}
+
+#region Logging
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
+
+if (builder.Environment.IsDevelopment())
+{
+    builder.Logging.AddDebug();
+    builder.Logging.SetMinimumLevel(LogLevel.Debug);
+}
+else
+{
+    builder.Logging.SetMinimumLevel(LogLevel.Warning);
+}
+#endregion
+
+#region Configuration
+var isProduction = builder.Environment.IsProduction();
+var jwtSecret = configuration["Jwt:Secret"] ??
+    throw new InvalidOperationException("JWT secret is not configured. Ensure 'Jwt:Secret' exists in appsettings or environment variables.");
+
+if (isProduction && (jwtSecret.Length < 32 || jwtSecret.Contains("change-this")))
+    throw new InvalidOperationException("JWT secret is not properly configured for production. Use a secure key of at least 32 characters.");
+
+var jwtIssuer = configuration["Jwt:Issuer"] ?? (isProduction ?
+    throw new InvalidOperationException("JWT Issuer is required in production") :
+    "https://localhost");
+
+var jwtAudience = configuration["Jwt:Audience"] ?? "SteepCoreAPI";
+
+// Validate production-specific settings
+if (isProduction)
+{
+    var geminiKey = configuration["AiEngine:Gemini:ApiKey"];
+    if (string.IsNullOrWhiteSpace(geminiKey) || geminiKey.Contains("your-google"))
+        throw new InvalidOperationException("Gemini API key is not configured for production.");
+
+    var stripeKey = configuration["Stripe:SecretKey"];
+    if (string.IsNullOrWhiteSpace(stripeKey) || !stripeKey.StartsWith("sk_live_"))
+        throw new InvalidOperationException("Stripe Secret Key must be a live key (sk_live_) in production.");
+
+    var connectionString = configuration.GetConnectionString("DefaultConnection");
+    if (string.IsNullOrWhiteSpace(connectionString) || connectionString.Contains("localhost"))
+        throw new InvalidOperationException("Database connection string must point to production database, not localhost.");
+}
+#endregion
+
+#region Database
+builder.Services.AddDbContext<ApplicationDbContext>(options =>
+{
+    var connectionString = configuration.GetConnectionString("DefaultConnection")
+        ?? throw new InvalidOperationException("DefaultConnection is not configured in appsettings.json");
+
+    options.UseNpgsql(connectionString, npgsqlOptions => npgsqlOptions.UseVector());
+});
+#endregion
+
+#region Identity
+builder.Services.AddIdentity<ApplicationUser, IdentityRole>(options =>
+{
+    options.Password.RequiredLength = 8;
+    options.Password.RequireDigit = true;
+    options.Password.RequireUppercase = true;
+    options.Password.RequireLowercase = true;
+    options.Password.RequireNonAlphanumeric = false;
+    options.User.RequireUniqueEmail = true;
+})
+.AddEntityFrameworkStores<ApplicationDbContext>()
+.AddDefaultTokenProviders();
+#endregion
+
+#region Authentication & Authorization
+var key = Encoding.UTF8.GetBytes(jwtSecret);
+
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(options =>
+{
+    options.RequireHttpsMetadata = isProduction;
+    options.SaveToken = true;
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(key),
+        ValidateIssuer = true,
+        ValidIssuer = jwtIssuer,
+        ValidateAudience = true,
+        ValidAudience = jwtAudience,
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.Zero
+    };
+});
+
+builder.Services.AddAuthorization();
+#endregion
+
+#region Service Registration
+builder.Services.AddScoped<IBlueprintService, BlueprintService>();
+builder.Services.AddScoped<IAiService, GeminiAiService>();
+builder.Services.AddScoped<IPaymentService, StripePaymentService>();
+builder.Services.AddScoped<IEmbeddingService, GeminiEmbeddingService>();
+
+builder.Services.AddHttpClient<GeminiAiService>(client =>
+{
+    client.DefaultRequestHeaders.Add("User-Agent", "SteepCoreAPI/1.0");
+    client.Timeout = TimeSpan.FromSeconds(60);
+});
+
+builder.Services.AddHttpClient<GeminiEmbeddingService>(client =>
+{
+    client.DefaultRequestHeaders.Add("User-Agent", "SteepCoreAPI/1.0");
+    client.Timeout = TimeSpan.FromSeconds(60);
+});
+
+builder.Services.AddHttpClient<StripePaymentService>(client =>
+{
+    client.DefaultRequestHeaders.Add("User-Agent", "SteepCoreAPI/1.0");
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+#endregion
+
+#region API Configuration
+builder.Services.AddControllers()
+    .AddJsonOptions(options =>
+    {
+        options.JsonSerializerOptions.PropertyNameCaseInsensitive = true;
+    });
+
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFrontend", corsPolicyBuilder =>
+    {
+        var frontendUrl = configuration["Frontend:Url"] ?? "http://localhost:3000";
+        corsPolicyBuilder
+            .WithOrigins(frontendUrl, "http://localhost:3000", "http://localhost:5173")
+            .AllowAnyMethod()
+            .AllowAnyHeader()
+            .AllowCredentials();
+    });
+});
+#endregion
+
+var app = builder.Build();
+
+#region Database Initialization
+using (var scope = app.Services.CreateScope())
+{
+    var services = scope.ServiceProvider;
+    var logger = services.GetRequiredService<ILoggerFactory>().CreateLogger("DatabaseInit");
+    try
+    {
+        var dbContext = services.GetRequiredService<ApplicationDbContext>();
+        var userManager = services.GetRequiredService<UserManager<ApplicationUser>>();
+
+        await dbContext.Database.MigrateAsync();
+        logger.LogInformation("Database migrations applied successfully.");
+
+        if (app.Environment.IsDevelopment())
+        {
+            await DbSeeder.InitializeAsync(dbContext, userManager, logger);
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "An error occurred while applying migrations or seeding database.");
+    }
+}
+#endregion
+
+#region Middleware Pipeline
+app.UseMiddleware<ExceptionHandlingMiddleware>();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseDeveloperExceptionPage();
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+else
+{
+    app.UseExceptionHandler("/error");
+    app.UseHsts();
+    app.UseHttpsRedirection();
+}
+
+// Log slow HTTP requests in production (> 1 second)
+if (app.Environment.IsProduction())
+{
+    app.Use(async (context, next) =>
+    {
+        var logger = context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("RequestMonitoring");
+        var startTime = DateTime.UtcNow;
+
+        await next();
+
+        var elapsed = DateTime.UtcNow - startTime;
+        if (elapsed.TotalSeconds > 1)
+        {
+            logger.LogWarning("Slow request: {Method} {Path} took {ElapsedMs}ms with status {StatusCode}",
+                context.Request.Method, context.Request.Path, elapsed.TotalMilliseconds, context.Response.StatusCode);
+        }
+    });
+}
+
+app.UseCors("AllowFrontend");
+app.UseAuthentication();
+app.UseAuthorization();
+app.MapControllers();
+
+// Error handling endpoint
+app.MapGet("/error", (HttpContext context, ILoggerFactory loggerFactory) =>
+{
+    var logger = loggerFactory.CreateLogger("ErrorHandler");
+    var exceptionHandlerPathFeature = context.Features.Get<IExceptionHandlerPathFeature>();
+    var exception = exceptionHandlerPathFeature?.Error;
+
+    if (exception != null)
+    {
+        logger.LogError(exception, "Unhandled exception routed to /error endpoint");
+    }
+
+    return Results.Problem(
+        detail: app.Environment.IsDevelopment() ? exception?.Message : "An internal error occurred.",
+        statusCode: 500
+    );
+})
+.WithName("Error")
+.AllowAnonymous();
+
+app.MapGet("/health", () => Results.Ok(new
+{
+    status = "healthy",
+    timestamp = DateTime.UtcNow,
+    environment = app.Environment.EnvironmentName
+}))
+.WithName("Health")
+.AllowAnonymous();
+
+app.MapGet("/health/ready", async (HttpContext context, ILoggerFactory loggerFactory) =>
+{
+    try
+    {
+        var dbContext = context.RequestServices.GetRequiredService<ApplicationDbContext>();
+        await dbContext.Database.CanConnectAsync();
+        return Results.Ok(new { status = "ready", timestamp = DateTime.UtcNow });
+    }
+    catch (Exception ex)
+    {
+        var logger = loggerFactory.CreateLogger("HealthCheck");
+        logger.LogError(ex, "Readiness health check failed");
+        return Results.StatusCode(503);
+    }
+})
+.WithName("Readiness")
+.AllowAnonymous();
+#endregion
+
+// Run application
+app.Logger.LogInformation("Starting SteepCoreAPI in {Environment} environment", app.Environment.EnvironmentName);
+
+app.Run();
+
+public partial class Program { }
