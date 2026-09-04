@@ -36,7 +36,7 @@ public class AiController : ControllerBase
 
     [HttpPost("generate")]
     public async Task<ActionResult<AiBlueprintResponseDto>> GenerateRoadmap(
-        GenerateRequestDto request,
+        [FromBody] GenerateRequestDto request,
         CancellationToken cancellationToken)
     {
         if (request == null || string.IsNullOrWhiteSpace(request.Prompt) || request.Prompt.Length > 2000)
@@ -50,23 +50,58 @@ public class AiController : ControllerBase
 
             _logger.LogInformation("Roadmap generation requested by {UserId}. Prompt: {Prompt}", userId ?? "Guest", request.Prompt);
 
-            var promptVectorArray = await _embeddingService.GenerateEmbeddingAsync(request.Prompt, cancellationToken);
-            var promptVector = new Pgvector.Vector(promptVectorArray);
+            // 1. Normalize prompt for precise keyword/intent analysis
+            var normalizedInput = NormalizePrompt(request.Prompt);
 
-            var existingBlueprint = await _dbContext.Blueprints
-                .Include(b => b.Nodes)
-                .Include(b => b.Edges)
-                .Where(b => b.Embedding != null && b.Embedding.CosineDistance(promptVector) < 0.30)
-                .OrderBy(b => b.Embedding!.CosineDistance(promptVector))
-                .FirstOrDefaultAsync(cancellationToken);
+            // 2. LAYER 1: Direct Text / Keyword Matching (Catches variations like "Medical Doctor (MD)" vs "Doctor Roadmap")
+            // We search if any stored blueprint title shares the primary core subject.
+            Blueprint? existingBlueprint = null;
+
+            if (normalizedInput.Contains("doctor") || normalizedInput.Contains("medical"))
+            {
+                existingBlueprint = await _dbContext.Blueprints
+                    .Include(b => b.Nodes)
+                    .Include(b => b.Edges)
+                    .Where(b => b.Title.ToLower().Contains("doctor") || b.Title.ToLower().Contains("medicine"))
+                    .FirstOrDefaultAsync(cancellationToken);
+            }
+            else
+            {
+                // Fallback exact match on normalized title
+                existingBlueprint = await _dbContext.Blueprints
+                    .Include(b => b.Nodes)
+                    .Include(b => b.Edges)
+                    .Where(b => b.Title.ToLower() == request.Prompt.ToLower())
+                    .FirstOrDefaultAsync(cancellationToken);
+            }
+
+            // 3. LAYER 2: Semantic Vector Search Fallback (With a safer, controlled cosine distance)
+            if (existingBlueprint == null)
+            {
+                var promptVectorArray = await _embeddingService.GenerateEmbeddingAsync(request.Prompt, cancellationToken);
+                var promptVector = new Pgvector.Vector(promptVectorArray);
+
+                existingBlueprint = await _dbContext.Blueprints
+                    .Include(b => b.Nodes)
+                    .Include(b => b.Edges)
+                    .Where(b => b.Embedding != null && b.Embedding.CosineDistance(promptVector) < 0.25) // Tighter threshold to stop false duplicates
+                    .OrderBy(b => b.Embedding!.CosineDistance(promptVector))
+                    .FirstOrDefaultAsync(cancellationToken);
+            }
 
             if (existingBlueprint != null)
             {
-                _logger.LogInformation("Existing roadmap found via semantic search. ID: {Id}", existingBlueprint.Id);
+                _logger.LogInformation("Existing roadmap cache HIT found. ID: {Id} for query: {Prompt}", existingBlueprint.Id, request.Prompt);
                 return Ok(MapDbEntityToResponse(existingBlueprint));
             }
 
+            _logger.LogInformation("Cache MISS. Triggering Gemini AI generation for: {Prompt}", request.Prompt);
             var generated = await _service.GenerateRoadmapAsync(request.Prompt, cancellationToken);
+
+            if (generated == null || string.IsNullOrWhiteSpace(generated.Title))
+            {
+                return StatusCode(502, "Failed to retrieve a valid roadmap structure from AI.");
+            }
 
             var embeddingText = $"{generated.Title}. {generated.Description}. {generated.Domain}";
             var blueprintVectorArray = await _embeddingService.GenerateEmbeddingAsync(embeddingText, cancellationToken);
@@ -96,7 +131,6 @@ public class AiController : ControllerBase
                     var dbNodeId = Guid.NewGuid();
                     nodeMapping[node.Id] = dbNodeId;
 
-                    // Fix CS0029: Safely parse the AI string into the FlowchartNodeType Enum
                     Enum.TryParse<FlowchartNodeType>(node.Type, true, out var parsedType);
 
                     nodes.Add(new FlowchartNode
@@ -105,7 +139,7 @@ public class AiController : ControllerBase
                         BlueprintId = blueprintId,
                         Label = node.Label,
                         Type = parsedType,
-                        Description = string.Empty // Fix CS1061: Removed missing DTO reference
+                        Description = string.Empty
                     });
                 }
             }
@@ -134,9 +168,27 @@ public class AiController : ControllerBase
             blueprint.Edges = edges;
 
             _dbContext.Blueprints.Add(blueprint);
-            await _dbContext.SaveChangesAsync(cancellationToken);
 
-            _logger.LogInformation("New roadmap generated and saved successfully. ID: {BlueprintId}", blueprint.Id);
+            try
+            {
+                await _dbContext.SaveChangesAsync(cancellationToken);
+                _logger.LogInformation("New roadmap successfully generated and cached. ID: {BlueprintId}", blueprint.Id);
+            }
+            catch (DbUpdateException dbEx) when (dbEx.InnerException is Npgsql.PostgresException pgEx && pgEx.SqlState == "23505")
+            {
+                // Handles race conditions if concurrent requests attempt to insert the same topic simultaneously
+                _logger.LogWarning("Concurrent insertion race condition handled for prompt: {Prompt}", request.Prompt);
+                var concurrentMatch = await _dbContext.Blueprints
+                    .Include(b => b.Nodes)
+                    .Include(b => b.Edges)
+                    .FirstOrDefaultAsync(b => b.Title == generated.Title, cancellationToken);
+
+                if (concurrentMatch != null)
+                {
+                    return Ok(MapDbEntityToResponse(concurrentMatch));
+                }
+                throw;
+            }
 
             return Ok(MapToResponse(generated));
         }
@@ -147,7 +199,14 @@ public class AiController : ControllerBase
         }
     }
 
-    // Fix CS0104: Fully qualified the ambiguous DTO namespaces
+    private static string NormalizePrompt(string input)
+    {
+        var cleaned = new string(input.ToLower()
+            .Where(c => char.IsLetterOrDigit(c) || char.IsWhiteSpace(c))
+            .ToArray());
+        return string.Join(" ", cleaned.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries));
+    }
+
     private static AiBlueprintResponseDto MapToResponse(AiBlueprintDto bp) => new()
     {
         Title = bp.Title,
