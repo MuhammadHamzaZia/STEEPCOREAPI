@@ -50,32 +50,18 @@ public class AiController : ControllerBase
 
             _logger.LogInformation("Roadmap generation requested by {UserId}. Prompt: {Prompt}", userId ?? "Guest", request.Prompt);
 
-            // 1. Normalize prompt for precise keyword/intent analysis
+            var cleanQuery = request.Prompt.Trim().ToLower();
             var normalizedInput = NormalizePrompt(request.Prompt);
 
-            // 2. LAYER 1: Direct Text / Keyword Matching (Catches variations like "Medical Doctor (MD)" vs "Doctor Roadmap")
-            // We search if any stored blueprint title shares the primary core subject.
-            Blueprint? existingBlueprint = null;
-
-            if (normalizedInput.Contains("doctor") || normalizedInput.Contains("medical"))
-            {
-                existingBlueprint = await _dbContext.Blueprints
-                    .Include(b => b.Nodes)
-                    .Include(b => b.Edges)
-                    .Where(b => b.Title.ToLower().Contains("doctor") || b.Title.ToLower().Contains("medicine"))
-                    .FirstOrDefaultAsync(cancellationToken);
-            }
-            else
-            {
-                // Fallback exact match on normalized title
-                existingBlueprint = await _dbContext.Blueprints
-                    .Include(b => b.Nodes)
-                    .Include(b => b.Edges)
-                    .Where(b => b.Title.ToLower() == request.Prompt.ToLower())
-                    .FirstOrDefaultAsync(cancellationToken);
-            }
-
-            // 3. LAYER 2: Semantic Vector Search Fallback (With a safer, controlled cosine distance)
+            // TIER 1 & 2: Instant Exact & Multi-Keyword Title Match
+            Blueprint? existingBlueprint = await _dbContext.Blueprints
+                .Include(b => b.Nodes)
+                .Include(b => b.Edges)
+                .Where(b => b.Title.ToLower() == cleanQuery ||
+                            b.Title.ToLower().Contains(normalizedInput) ||
+                            normalizedInput.Contains(b.Title.ToLower()))
+                .FirstOrDefaultAsync(cancellationToken);
+            // TIER 3: Semantic Vector Search Fallback (Catches different phrasing and conceptual overlaps)
             if (existingBlueprint == null)
             {
                 var promptVectorArray = await _embeddingService.GenerateEmbeddingAsync(request.Prompt, cancellationToken);
@@ -84,14 +70,14 @@ public class AiController : ControllerBase
                 existingBlueprint = await _dbContext.Blueprints
                     .Include(b => b.Nodes)
                     .Include(b => b.Edges)
-                    .Where(b => b.Embedding != null && b.Embedding.CosineDistance(promptVector) < 0.25) // Tighter threshold to stop false duplicates
+                    .Where(b => b.Embedding != null && b.Embedding.CosineDistance(promptVector) < 0.32)
                     .OrderBy(b => b.Embedding!.CosineDistance(promptVector))
                     .FirstOrDefaultAsync(cancellationToken);
             }
 
             if (existingBlueprint != null)
             {
-                _logger.LogInformation("Existing roadmap cache HIT found. ID: {Id} for query: {Prompt}", existingBlueprint.Id, request.Prompt);
+                _logger.LogInformation("Lightning-fast cache HIT found. ID: {Id} for query: {Prompt}", existingBlueprint.Id, request.Prompt);
                 return Ok(MapDbEntityToResponse(existingBlueprint));
             }
 
@@ -176,7 +162,6 @@ public class AiController : ControllerBase
             }
             catch (DbUpdateException dbEx) when (dbEx.InnerException is Npgsql.PostgresException pgEx && pgEx.SqlState == "23505")
             {
-                // Handles race conditions if concurrent requests attempt to insert the same topic simultaneously
                 _logger.LogWarning("Concurrent insertion race condition handled for prompt: {Prompt}", request.Prompt);
                 var concurrentMatch = await _dbContext.Blueprints
                     .Include(b => b.Nodes)
