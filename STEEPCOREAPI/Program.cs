@@ -24,7 +24,6 @@ if (!builder.Environment.IsDevelopment())
 #region Logging
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
-
 if (builder.Environment.IsDevelopment())
 {
     builder.Logging.AddDebug();
@@ -93,7 +92,6 @@ builder.Services.AddIdentity<ApplicationUser, IdentityRole>(options =>
 
 #region Authentication & Authorization
 var key = Encoding.UTF8.GetBytes(jwtSecret);
-
 builder.Services.AddAuthentication(options =>
 {
     options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
@@ -114,8 +112,29 @@ builder.Services.AddAuthentication(options =>
         ValidateLifetime = true,
         ClockSkew = TimeSpan.Zero
     };
-});
 
+    // Hybrid extraction: Checks HttpOnly cookie first, falls back to Authorization header
+    options.Events = new JwtBearerEvents
+    {
+        OnMessageReceived = context =>
+        {
+            // 1. Check browser cookie (used by web apps)
+            context.Token = context.Request.Cookies["access_token"];
+
+            // 2. Fall back to Authorization Bearer header if cookie is empty (used by mobile apps, Postman, or Swagger)
+            if (string.IsNullOrEmpty(context.Token))
+            {
+                var authHeader = context.Request.Headers["Authorization"].FirstOrDefault();
+                if (!string.IsNullOrEmpty(authHeader) && authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Token = authHeader["Bearer ".Length..].Trim();
+                }
+            }
+
+            return Task.CompletedTask;
+        }
+    };
+});
 builder.Services.AddAuthorization();
 #endregion
 
@@ -194,13 +213,13 @@ using (var scope = app.Services.CreateScope())
     }
 }
 #endregion
+
 #region Middleware Pipeline
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 
 // Enable Swagger if in Development OR if explicitly enabled in Render's Environment Variables
 var enableSwagger = app.Environment.IsDevelopment() ||
                     builder.Configuration.GetValue<bool>("ENABLE_SWAGGER");
-
 if (enableSwagger)
 {
     app.UseSwagger();
@@ -244,6 +263,7 @@ if (app.Environment.IsProduction())
 app.UseCors("AllowFrontend");
 app.UseAuthentication();
 app.UseAuthorization();
+
 app.MapControllers();
 
 // Error handling endpoint
@@ -296,7 +316,6 @@ app.MapGet("/health/ready", async (HttpContext context, ILoggerFactory loggerFac
 
 // Run application
 app.Logger.LogInformation("Starting SteepCoreAPI in {Environment} environment", app.Environment.EnvironmentName);
-
 app.Run();
 
 public partial class Program { }

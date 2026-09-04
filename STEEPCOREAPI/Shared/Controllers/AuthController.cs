@@ -62,6 +62,10 @@ public class AuthController : ControllerBase
                 return BadRequest(new { message = "Registration failed", errors = result.Errors });
             }
 
+            // Automatically generate token and set cookie on successful registration
+            var token = GenerateJwtToken(user);
+            SetTokenCookie(token);
+
             _logger.LogInformation($"User registered successfully: {request.Email}");
 
             return Ok(new AuthResponseDto
@@ -80,7 +84,7 @@ public class AuthController : ControllerBase
 
     [HttpPost("login")]
     [AllowAnonymous]
-    public async Task<ActionResult<LoginResponseDto>> Login([FromBody] LoginRequestDto request)
+    public async Task<ActionResult<AuthResponseDto>> Login([FromBody] LoginRequestDto request)
     {
         if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.Password))
             return BadRequest("Email and password are required");
@@ -102,15 +106,15 @@ public class AuthController : ControllerBase
             }
 
             var token = GenerateJwtToken(user);
+            SetTokenCookie(token);
 
             _logger.LogInformation($"User logged in successfully: {request.Email}");
 
-            return Ok(new LoginResponseDto
+            return Ok(new AuthResponseDto
             {
-                Token = token,
+                Message = "Logged in successfully",
                 Email = user.Email,
-                UserId = user.Id,
-                ExpiresIn = int.Parse(_configuration["Jwt:ExpiryMinutes"] ?? "60") * 60
+                UserId = user.Id
             });
         }
         catch (Exception ex)
@@ -122,7 +126,7 @@ public class AuthController : ControllerBase
 
     [HttpPost("refresh")]
     [Authorize]
-    public ActionResult<LoginResponseDto> RefreshToken()
+    public ActionResult<AuthResponseDto> RefreshToken()
     {
         var userId = User.FindFirst("sub")?.Value ?? User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
         var email = User.FindFirst(ClaimTypes.Email)?.Value;
@@ -134,13 +138,13 @@ public class AuthController : ControllerBase
         {
             var user = new ApplicationUser { Id = userId, Email = email ?? "" };
             var token = GenerateJwtToken(user);
+            SetTokenCookie(token);
 
-            return Ok(new LoginResponseDto
+            return Ok(new AuthResponseDto
             {
-                Token = token,
-                Email = email,
-                UserId = userId,
-                ExpiresIn = int.Parse(_configuration["Jwt:ExpiryMinutes"] ?? "60") * 60
+                Message = "Token refreshed successfully",
+                Email = email ?? string.Empty,
+                UserId = userId
             });
         }
         catch (Exception ex)
@@ -148,6 +152,34 @@ public class AuthController : ControllerBase
             _logger.LogError(ex, "Error refreshing token");
             return StatusCode(500, "Error refreshing token");
         }
+    }
+
+    [HttpPost("logout")]
+    [Authorize]
+    public IActionResult Logout()
+    {
+        // Clear the HttpOnly cookie securely
+        Response.Cookies.Delete("access_token", new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.None
+        });
+
+        return Ok(new { message = "Logged out successfully" });
+    }
+
+    private void SetTokenCookie(string token)
+    {
+        var expiryMinutes = int.Parse(_configuration["Jwt:ExpiryMinutes"] ?? "60");
+
+        Response.Cookies.Append("access_token", token, new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true, // Required for HTTPS on Render
+            SameSite = SameSiteMode.None, // Required if frontend and backend are hosted on separate domains (e.g. Vercel & Render)
+            Expires = DateTime.UtcNow.AddMinutes(expiryMinutes)
+        });
     }
 
     private string GenerateJwtToken(ApplicationUser user)
@@ -199,14 +231,6 @@ public class AuthResponseDto
     public string Message { get; set; } = string.Empty;
     public string Email { get; set; } = string.Empty;
     public string UserId { get; set; } = string.Empty;
-}
-
-public class LoginResponseDto
-{
-    public string Token { get; set; } = string.Empty;
-    public string Email { get; set; } = string.Empty;
-    public string UserId { get; set; } = string.Empty;
-    public int ExpiresIn { get; set; }
 }
 
 #endregion
