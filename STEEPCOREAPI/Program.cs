@@ -193,16 +193,27 @@ using (var scope = app.Services.CreateScope())
         logger.LogError(ex, "An error occurred while applying migrations or seeding database.");
     }
 }
-#endregion
 
 #region Middleware Pipeline
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 
+// Enable Swagger if in Development OR if explicitly enabled in Render's Environment Variables
+var enableSwagger = app.Environment.IsDevelopment() ||
+                    builder.Configuration.GetValue<bool>("ENABLE_SWAGGER");
+
+if (enableSwagger)
+{
+    app.UseSwagger();
+    app.UseSwaggerUI(c =>
+    {
+        c.SwaggerEndpoint("/swagger/v1/swagger.json", "Steepcore API v1");
+        c.RoutePrefix = "swagger"; // Available at /swagger
+    });
+}
+
 if (app.Environment.IsDevelopment())
 {
     app.UseDeveloperExceptionPage();
-    app.UseSwagger();
-    app.UseSwaggerUI();
 }
 else
 {
