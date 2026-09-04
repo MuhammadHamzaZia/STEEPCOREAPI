@@ -193,7 +193,7 @@ using (var scope = app.Services.CreateScope())
         logger.LogError(ex, "An error occurred while applying migrations or seeding database.");
     }
 }
-
+#endregion
 #region Middleware Pipeline
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 
