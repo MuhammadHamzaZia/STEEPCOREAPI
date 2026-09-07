@@ -173,16 +173,15 @@ builder.Services.AddControllers()
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// UPDATED CORS POLICY: Allow AI Studio and any other frontend origin to connect
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", corsPolicyBuilder =>
     {
-        var frontendUrl = configuration["Frontend:Url"] ?? "http://localhost:3000";
         corsPolicyBuilder
-            .WithOrigins(frontendUrl, "http://localhost:3000", "http://localhost:5173")
+            .AllowAnyOrigin()
             .AllowAnyMethod()
-            .AllowAnyHeader()
-            .AllowCredentials();
+            .AllowAnyHeader();
     });
 });
 #endregion
